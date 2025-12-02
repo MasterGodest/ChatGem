@@ -1,43 +1,63 @@
 import os
 import logging
+
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
 import google.generativeai as genai
 
-# ЛОГИ
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("Переменная окружения TELEGRAM_TOKEN не задана")
+
+if not GEMINI_API_KEY:
+    raise RuntimeError("Переменная окружения GEMINI_API_KEY не задана")
+
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")
+gemini_model = genai.GenerativeModel("gemini-1.5-flash")
 
-# Команда /start
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Я Gemini-бот 🚀\nНапиши мне что-нибудь!")
+    await update.message.reply_text(
+        "Привет! Я бот на Gemini 🤖\n"
+        "Просто напиши мне сообщение, и я отвечу."
+    )
 
-# Обработка сообщений
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_msg = update.message.text
+    user_text = update.message.text
 
     try:
-        response = model.generate_content(user_msg)
+        response = gemini_model.generate_content(user_text)
         answer = response.text
     except Exception as e:
-        answer = f"Ошибка Gemini: {e}"
+        answer = f"Ошибка при обращении к Gemini: {e}"
 
     await update.message.reply_text(answer)
 
-# Главный запуск
+
 def main():
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT, handle_message))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # режим polling
-    application.run_polling()
+    print("BOT STARTED (GEMINI ONLY, POLLING)")
+    app.run_polling()
+
 
 if __name__ == "__main__":
     main()
