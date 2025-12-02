@@ -17,17 +17,15 @@ from telegram.ext import (
     filters,
 )
 
-from openai import OpenAI
 from google import genai
 
 
 # ========= КОНФИГ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ =========
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# список id админов через запятую: "123,456"
+# список id админов: ADMIN_IDS="12345,67890"
 _admin_ids_str = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS = {
     int(x.strip())
@@ -38,434 +36,250 @@ ADMIN_IDS = {
 DEFAULT_DAILY_LIMIT = 100
 MAX_HISTORY_MESSAGES = 20
 
+# ===== ТОЛЬКО МОДЕЛИ GEMINI =====
 MODEL_OPTIONS = {
-    "openai": [
-        ("gpt-5.1", "GPT-5.1"),
-        ("gpt-5.1-mini", "GPT-5.1 Mini"),
-        ("gpt-4.1", "GPT-4.1"),
-        ("o3-mini", "o3-mini (reasoning)"),
-    ],
     "gemini": [
-        ("gemini-3.0-flash", "Gemini 3.0 Flash"),
-        ("gemini-3.0-pro", "Gemini 3.0 Pro"),
-        ("gemini-2.0-flash", "Gemini 2.0 Flash"),
         ("gemini-1.5-flash", "Gemini 1.5 Flash"),
+        ("gemini-1.5-pro", "Gemini 1.5 Pro"),
     ],
 }
 
-DEFAULT_PROVIDER = "openai"
-DEFAULT_OPENAI_MODEL = "gpt-5.1-mini"
-DEFAULT_GEMINI_MODEL = "gemini-3.0-flash"
-
-IMAGE_MODEL = "gpt-image-1"
+DEFAULT_PROVIDER = "gemini"
+DEFAULT_GEMINI_MODEL = "gemini-1.5-flash"
 
 
-# ========= КЛИЕНТЫ API =========
+# ========= ИНИЦИАЛИЗАЦИЯ =========
 
 if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("Не задан TELEGRAM_TOKEN в переменных окружения")
-
-if not OPENAI_API_KEY:
-    raise RuntimeError("Не задан OPENAI_API_KEY в переменных окружения")
+    raise RuntimeError("Не задан TELEGRAM_TOKEN")
 
 if not GEMINI_API_KEY:
-    raise RuntimeError("Не задан GEMINI_API_KEY в переменных окружения")
+    raise RuntimeError("Не задан GEMINI_API_KEY")
 
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
 genai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 
-# ========= СОСТОЯНИЕ В ПАМЯТИ =========
+# ========= ПАМЯТЬ =========
 
 user_state: Dict[int, Dict[str, Any]] = {}
 user_limits: Dict[int, Dict[str, Any]] = {}
 stats: Dict[str, Any] = {
-    "total_messages": 0,
     "total_users": set(),
+    "total_messages": 0,
 }
 
 
-# ========= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =========
-
-def provider_human(provider: str) -> str:
-    return "OpenAI" if provider == "openai" else "Gemini"
-
+# ========= ВСПОМОГАТЕЛЬНЫЕ =========
 
 def get_today_str() -> str:
     return datetime.date.today().isoformat()
 
-
-def get_user_limit_info(user_id: int) -> Dict[str, Any]:
+def get_user_limit_info(uid: int):
     today = get_today_str()
-    info = user_limits.get(user_id)
-    if info is None or info.get("date") != today:
-        info = {
-            "date": today,
-            "used": 0,
-            "limit": DEFAULT_DAILY_LIMIT,
-        }
-        user_limits[user_id] = info
+    info = user_limits.get(uid)
+    if not info or info["date"] != today:
+        info = {"date": today, "used": 0, "limit": DEFAULT_DAILY_LIMIT}
+        user_limits[uid] = info
     return info
 
-
-def inc_user_usage(user_id: int, amount: int = 1) -> None:
-    info = get_user_limit_info(user_id)
+def inc_user_usage(uid: int, amount: int = 1):
+    info = get_user_limit_info(uid)
     info["used"] += amount
 
-
-def get_user_state(user_id: int) -> Dict[str, Any]:
-    if user_id not in user_state:
-        user_state[user_id] = {
-            "provider": DEFAULT_PROVIDER,
-            "model": DEFAULT_OPENAI_MODEL,
+def get_user_state(uid: int):
+    if uid not in user_state:
+        user_state[uid] = {
+            "provider": "gemini",
+            "model": DEFAULT_GEMINI_MODEL,
             "history": [],
-            "awaiting_image_prompt": False,
+            "awaiting_image": False,
         }
-    return user_state[user_id]
+    return user_state[uid]
+
+def reset_user_history(uid: int):
+    user_state[uid]["history"] = []
+
+def is_admin(uid: int):
+    return uid in ADMIN_IDS
 
 
-def reset_user_history(user_id: int) -> None:
-    state = get_user_state(user_id)
-    state["history"] = []
+# ========= КНОПКИ =========
 
-
-def build_main_keyboard(is_admin: bool) -> ReplyKeyboardMarkup:
-    keyboard = [
+def build_main_keyboard(is_admin_user):
+    kb = [
         ["🧠 Выбрать модель", "🆕 Новая сессия"],
-        ["🖼 Картинка", "ℹ️ Моя информация"],
-        ["❓ Помощь"],
+        ["ℹ️ Моя информация", "❓ Помощь"],
     ]
-    if is_admin:
-        keyboard.append(["👑 Админ"])
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    if is_admin_user:
+        kb.append(["👑 Админ"])
+    return ReplyKeyboardMarkup(kb, resize_keyboard=True)
+
+def build_models_keyboard():
+    rows = []
+    rows.append([InlineKeyboardButton("✨ Модели Gemini", callback_data="noop")])
+
+    for name, label in MODEL_OPTIONS["gemini"]:
+        rows.append(
+            [InlineKeyboardButton(label, callback_data=f"gemini|{name}")]
+        )
+
+    return InlineKeyboardMarkup(rows)
 
 
-def build_models_keyboard() -> InlineKeyboardMarkup:
-    keyboard: List[List[InlineKeyboardButton]] = []
+# ========= ВЫЗОВ GEMINI =========
 
-    keyboard.append([InlineKeyboardButton("🤖 Модели OpenAI", callback_data="noop")])
-    for model_name, label in MODEL_OPTIONS["openai"]:
-        keyboard.append([
-            InlineKeyboardButton(label, callback_data=f"openai|{model_name}")
-        ])
-
-    keyboard.append([InlineKeyboardButton(" ", callback_data="noop2")])
-
-    keyboard.append([InlineKeyboardButton("✨ Модели Gemini", callback_data="noop")])
-    for model_name, label in MODEL_OPTIONS["gemini"]:
-        keyboard.append([
-            InlineKeyboardButton(label, callback_data=f"gemini|{model_name}")
-        ])
-
-    return InlineKeyboardMarkup(keyboard)
-
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-
-def format_user_info(user_id: int) -> str:
-    state = get_user_state(user_id)
-    limit_info = get_user_limit_info(user_id)
-    return (
-        f"ID: {user_id}\n"
-        f"Текущая модель: {provider_human(state['provider'])} ({state['model']})\n"
-        f"Лимит на сегодня: {limit_info['used']} / {limit_info['limit']} сообщений."
-    )
-
-
-# ========= ВЫЗОВЫ ИИ =========
-
-async def call_openai_chat(user_id: int, user_text: str, model_name: str) -> str:
-    state = get_user_state(user_id)
-    history = state["history"]
-
-    if not history:
-        history.append({
-            "role": "system",
-            "content": "Ты дружелюбный и полезный ассистент, отвечай по-русски.",
-        })
-
-    history.append({"role": "user", "content": user_text})
-
-    resp = openai_client.chat.completions.create(
-        model=model_name,
-        messages=history,
-    )
-    answer = resp.choices[0].message.content
-
-    history.append({"role": "assistant", "content": answer})
-    if len(history) > MAX_HISTORY_MESSAGES:
-        state["history"] = history[-MAX_HISTORY_MESSAGES:]
-
-    return answer
-
-
-async def call_gemini_chat(user_id: int, user_text: str, model_name: str) -> str:
-    state = get_user_state(user_id)
+async def call_gemini_chat(uid: int, text: str, model: str) -> str:
+    state = get_user_state(uid)
     history = state["history"]
 
     lines = []
     for msg in history:
-        if msg.get("role") == "user":
-            lines.append("Пользователь: " + msg.get("content", ""))
-        elif msg.get("role") == "assistant":
-            lines.append("Ассистент: " + msg.get("content", ""))
+        if msg["role"] == "user":
+            lines.append("Пользователь: " + msg["content"])
+        else:
+            lines.append("Ассистент: " + msg["content"])
+    lines.append("Пользователь: " + text)
 
-    lines.append("Пользователь: " + user_text)
     prompt = "\n".join(lines)
 
-    response = genai_client.models.generate_content(
-        model=model_name,
-        contents=prompt,
+    resp = genai_client.models.generate_content(
+        model=model,
+        contents=prompt
     )
-    answer = response.text
 
-    history.append({"role": "user", "content": user_text})
+    answer = resp.text
+
+    history.append({"role": "user", "content": text})
     history.append({"role": "assistant", "content": answer})
+
     if len(history) > MAX_HISTORY_MESSAGES:
-        state["history"] = history[-MAX_HISTORY_MESSAGES:]
+        history[:] = history[-MAX_HISTORY_MESSAGES:]
 
     return answer
 
 
-async def generate_image(prompt: str) -> str:
-    img = openai_client.images.generate(
-        model=IMAGE_MODEL,
-        prompt=prompt,
-        size="1024x1024",
-        n=1,
-    )
-    return img.data[0].url
-
-
-# ========= КОМАНДЫ ПОЛЬЗОВАТЕЛЯ =========
+# ========= КОМАНДЫ =========
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    user_id = user.id
-    stats["total_users"].add(user_id)
+    uid = update.effective_user.id
+    stats["total_users"].add(uid)
 
-    kb = build_main_keyboard(is_admin(user_id))
-
-    text = (
+    await update.message.reply_text(
         "Привет! 👋\n\n"
-        "Я ИИ-бот в Telegram.\n\n"
-        "Могу работать с:\n"
-        "• ChatGPT 5.1 / 5.1-mini / 4.1 / o3-mini\n"
-        "• Gemini 3.0 / 2.0 / 1.5\n\n"
-        "Кнопки снизу помогут управлять мной 🙂"
+        "Я ИИ-бот только на Gemini! 🔥\n\n"
+        "Работаю с моделями:\n"
+        "• Gemini 1.5 Flash\n"
+        "• Gemini 1.5 Pro\n\n"
+        "Используй кнопки ниже 😊",
+        reply_markup=build_main_keyboard(is_admin(uid))
     )
-
-    await update.message.reply_text(text, reply_markup=kb)
-
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start_cmd(update, context)
 
-
 async def models_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Выбери модель:",
-        reply_markup=build_models_keyboard(),
+        "Выбери модель Gemini:",
+        reply_markup=build_models_keyboard()
     )
-
 
 async def new_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    reset_user_history(user_id)
-    await update.message.reply_text("🧹 История очищена. Начинаем заново!")
-
+    reset_user_history(update.effective_user.id)
+    await update.message.reply_text("🧹 История очищена!")
 
 async def me_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    info = format_user_info(user_id)
-    await update.message.reply_text("Твоя информация:\n\n" + info)
+    uid = update.effective_user.id
+    st = get_user_state(uid)
+    info = get_user_limit_info(uid)
 
-
-async def img_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    limit_info = get_user_limit_info(user_id)
-    if limit_info["used"] >= limit_info["limit"]:
-        await update.message.reply_text("🚫 Лимит на сегодня исчерпан.")
-        return
-
-    if context.args:
-        prompt = " ".join(context.args)
-    else:
-        await update.message.reply_text(
-            "Использование: /img кот в космосе\n"
-            "Или через кнопку «🖼 Картинка»."
-        )
-        return
-
-    await update.message.reply_text("🎨 Генерирую картинку...")
-
-    try:
-        url = await generate_image(prompt)
-        inc_user_usage(user_id, amount=3)
-        stats["total_messages"] += 1
-        await update.message.reply_photo(
-            photo=url,
-            caption=f"Готово!\n\nЗапрос: {prompt}",
-        )
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка при генерации изображения: {e}")
-
-
-# ========= АДМИНКА =========
+    await update.message.reply_text(
+        f"ID: {uid}\n"
+        f"Модель: {st['model']}\n"
+        f"Лимит: {info['used']} / {info['limit']}"
+    )
 
 async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("⛔ Эта команда только для админа.")
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Нет доступа.")
         return
 
-    total_users = len(stats["total_users"])
-    total_messages = stats["total_messages"]
-
-    txt = (
-        "👑 Админ-панель\n\n"
-        f"Всего пользователей: {total_users}\n"
-        f"Всего сообщений: {total_messages}\n\n"
-        "Пока тут только статистика 🙂"
-    )
-    await update.message.reply_text(txt)
-
-
-# ========= ОБРАБОТКА ИНЛАЙН-КНОПОК =========
-
-async def model_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    data = query.data
-    user_id = query.from_user.id
-
-    if data.startswith("noop"):
-        await query.answer()
-        return
-
-    try:
-        provider, model_name = data.split("|", 1)
-    except ValueError:
-        await query.answer("Ошибка данных кнопки.", show_alert=True)
-        return
-
-    state = get_user_state(user_id)
-    state["provider"] = provider
-    state["model"] = model_name
-
-    await query.answer()
-    await query.edit_message_text(
-        f"✅ Модель переключена!\n"
-        f"Провайдер: {provider_human(provider)}\n"
-        f"Модель: {model_name}\n\n"
-        f"Теперь просто напиши сообщение, и я отвечу этой моделью."
+    await update.message.reply_text(
+        f"👑 Админ панель\n\n"
+        f"Пользователей: {len(stats['total_users'])}\n"
+        f"Сообщений: {stats['total_messages']}"
     )
 
 
-# ========= ОСНОВНОЙ ТЕКСТОВЫЙ ХЕНДЛЕР =========
+# ========= ИНЛАЙН-КНОПКИ =========
+
+async def model_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.data.startswith("noop"):
+        await q.answer()
+        return
+
+    provider, model = q.data.split("|")
+    st = get_user_state(q.from_user.id)
+
+    st["provider"] = provider
+    st["model"] = model
+
+    await q.answer()
+    await q.edit_message_text(
+        f"Модель переключена!\n"
+        f"Провайдер: Gemini\n"
+        f"Модель: {model}\n\n"
+        f"Пиши сообщение 🙂"
+    )
+
+
+# ========= ТЕКСТ =========
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    if not message or not message.text:
+    msg = update.message
+    if not msg or not msg.text:
         return
 
-    user = update.effective_user
-    user_id = user.id
-    stats["total_users"].add(user_id)
+    uid = msg.from_user.id
+    text = msg.text
 
-    state = get_user_state(user_id)
-    text = message.text.strip()
-
-    # Кнопки
     if text == "🧠 Выбрать модель":
-        await message.reply_text(
-            "Выбери модель:",
-            reply_markup=build_models_keyboard(),
-        )
+        await msg.reply_text("Выбери модель:", reply_markup=build_models_keyboard())
         return
 
     if text == "🆕 Новая сессия":
-        reset_user_history(user_id)
-        await message.reply_text("🧹 История очищена!")
-        return
-
-    if text == "🖼 Картинка":
-        state["awaiting_image_prompt"] = True
-        await message.reply_text("Напиши описание картинки.")
+        reset_user_history(uid)
+        await msg.reply_text("Готово! История очищена.")
         return
 
     if text == "ℹ️ Моя информация":
-        info = format_user_info(user_id)
-        await message.reply_text("Твоя информация:\n\n" + info)
+        await me_cmd(update, context)
         return
 
     if text == "❓ Помощь":
         await help_cmd(update, context)
         return
 
-    if text == "👑 Админ" and is_admin(user_id):
+    if text == "👑 Админ" and is_admin(uid):
         await admin_cmd(update, context)
         return
 
-    # Команды
-    if text.startswith("/"):
-        cmd, *args = text.split()
-        args_str = " ".join(args)
-        context.args = args  # чтобы /img работала
-
-        if cmd == "/start":
-            await start_cmd(update, context)
-        elif cmd == "/help":
-            await help_cmd(update, context)
-        elif cmd == "/models":
-            await models_cmd(update, context)
-        elif cmd == "/new":
-            await new_cmd(update, context)
-        elif cmd == "/me":
-            await me_cmd(update, context)
-        elif cmd == "/img":
-            await img_cmd(update, context)
-        elif cmd == "/admin":
-            await admin_cmd(update, context)
-        else:
-            await message.reply_text("Неизвестная команда. Напиши /start.")
+    # ПРОСТО ОТВЕТ GEMINI
+    info = get_user_limit_info(uid)
+    if info["used"] >= info["limit"]:
+        await msg.reply_text("🚫 Лимит исчерпан. Попробуй завтра.")
         return
 
-    # ожидаем описание для картинки
-    if state.get("awaiting_image_prompt"):
-        state["awaiting_image_prompt"] = False
-        await img_cmd(update, context)
-        return
-
-    # проверка лимита
-    limit_info = get_user_limit_info(user_id)
-    if limit_info["used"] >= limit_info["limit"]:
-        await message.reply_text(
-            "🚫 Ты исчерпал дневной лимит сообщений. Попробуй завтра."
-        )
-        return
-
-    provider = state["provider"]
-    model_name = state["model"]
-
-    await message.chat.send_action("typing")
+    st = get_user_state(uid)
 
     try:
-        if provider == "openai":
-            answer = await call_openai_chat(user_id, text, model_name)
-        else:
-            answer = await call_gemini_chat(user_id, text, model_name)
-
-        inc_user_usage(user_id)
+        answer = await call_gemini_chat(uid, text, st["model"])
+        inc_user_usage(uid)
         stats["total_messages"] += 1
     except Exception as e:
-        answer = (
-            f"⚠️ Ошибка при обращении к {provider_human(provider)} "
-            f"({model_name}): {e}"
-        )
+        answer = f"Ошибка при обращении к Gemini: {e}"
 
-    await message.reply_text(answer)
+    await msg.reply_text(answer)
 
 
 # ========= MAIN =========
@@ -478,13 +292,12 @@ def main():
     app.add_handler(CommandHandler("models", models_cmd))
     app.add_handler(CommandHandler("new", new_cmd))
     app.add_handler(CommandHandler("me", me_cmd))
-    app.add_handler(CommandHandler("img", img_cmd))
     app.add_handler(CommandHandler("admin", admin_cmd))
 
-    app.add_handler(CallbackQueryHandler(model_button_handler))
+    app.add_handler(CallbackQueryHandler(model_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-    print("Бот запущен.")
+    print("BOT STARTED (GEMINI ONLY)")
     app.run_polling()
 
 
